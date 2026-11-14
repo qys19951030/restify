@@ -20,6 +20,38 @@ Args:
   <url>  A URL to RESTify into JSON
 ```
 
+## Batch mode
+
+Passing `--seeds` switches the utility into batch mode, crawling many pages
+and writing one JSON line per page to the file given by `--out`:
+
+```bash
+restify --seeds seeds.txt --out pages.jsonl --state progress.json
+```
+
+The seeds file lists one start URL per line; blank lines and lines starting
+with `#` are ignored, and duplicates (after normalizing case, default ports
+and fragments) are only crawled once. From each seed the crawler follows
+`rel="next"` links, up to `--max-pages` pages per seed (default 5).
+
+Requests are limited to `--concurrency` in flight overall (default 4), one
+in-flight request per host, and at least `--per-host-interval` between
+requests to the same host (default 500ms). Network errors, 429 and 5xx
+responses are retried up to `--max-retries` times (default 3), honoring
+`Retry-After`; other 4xx responses fail that seed without affecting the
+rest of the batch.
+
+Each output line looks like:
+
+```json
+{"url":"...final URL...","seed":"...seed URL...","page":1,"status":200,"nodes":[...]}
+```
+
+Progress is persisted to the `--state` file after every record, so an
+interrupted run can simply be re-started with the same arguments: completed
+or failed seeds are skipped and an unfinished seed resumes where it stopped.
+The command exits non-zero if any seed failed.
+
 ## Output Structure
 
 When a successful URL retrieval and match occurs, the utility will output

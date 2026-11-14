@@ -24,9 +24,10 @@ type fetchError struct {
 func (e *fetchError) Error() string { return e.msg }
 
 // hostLimiter serializes requests to one host and enforces the minimum
-// interval between consecutive request starts.
+// interval between consecutive request starts. The semaphore has capacity
+// one; last is only accessed while holding it.
 type hostLimiter struct {
-	mu   sync.Mutex
+	sem  chan struct{}
 	last time.Time
 }
 
@@ -162,24 +163,28 @@ func (f *fetcher) acquireHost(ctx context.Context, host string) (func(), error) 
 	f.hostsMu.Lock()
 	limiter, ok := f.hosts[host]
 	if !ok {
-		limiter = &hostLimiter{}
+		limiter = &hostLimiter{sem: make(chan struct{}, 1)}
 		f.hosts[host] = limiter
 	}
 	f.hostsMu.Unlock()
 
-	limiter.mu.Lock()
+	select {
+	case limiter.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if wait := time.Until(limiter.last.Add(f.perHostInterval)); wait > 0 {
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
-			limiter.mu.Unlock()
+			<-limiter.sem
 			return nil, ctx.Err()
 		}
 	}
 	limiter.last = time.Now()
-	return limiter.mu.Unlock, nil
+	return func() { <-limiter.sem }, nil
 }
 
 // parseRetryAfter interprets a Retry-After header value, either as seconds

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -152,9 +153,12 @@ func convergingServer(t *testing.T) (*httptest.Server, func(string) int32) {
 func TestConcurrentDedup(t *testing.T) {
 	server, hits := convergingServer(t)
 	seeds := writeSeedsFile(t, server.URL+"/a/1\n"+server.URL+"/b/1\n")
+	dir := t.TempDir()
 
 	summary, err := runBatch(context.Background(), batchOptions{
 		seedsPath:   seeds,
+		outPath:     filepath.Join(dir, "out.jsonl"),
+		statePath:   filepath.Join(dir, "state.json"),
 		maxPages:    5,
 		concurrency: 4,
 	})

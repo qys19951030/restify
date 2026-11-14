@@ -153,6 +153,10 @@ func runBatchMode() {
 		log.Fatal("Batch run failed: ", err)
 	}
 	printBatchSummary(summary)
+	if summary.Interrupted {
+		log.Println("Interrupted: progress saved, re-run to resume")
+		os.Exit(2)
+	}
 	if summary.Failed > 0 {
 		os.Exit(1)
 	}
