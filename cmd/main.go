@@ -42,7 +42,7 @@ var (
 	seedsPath = kingpin.Flag("seeds", "Path to a file of seed URLs, one per line. Enables batch mode.").
 			String()
 	outPath = kingpin.Flag("out", "Path of the JSONL file batch mode writes page records to").
-			String()
+		String()
 	statePath = kingpin.Flag("state", "Path of the progress file batch mode uses to resume interrupted runs").
 			String()
 	maxPages = kingpin.Flag("max-pages", "Maximum number of pages to fetch per seed when following rel=next links").

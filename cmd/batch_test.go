@@ -140,10 +140,11 @@ func TestCrawlSeedPagination(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newCrawler(batchOptions{maxPages: tc.maxPages})
-			records, failure := c.crawlSeed(context.Background(), tc.seed)
-			if failure != nil {
-				t.Fatalf("unexpected failure: %+v", failure)
+			outcome := c.crawlSeed(context.Background(), 0, tc.seed)
+			if outcome.failure != nil {
+				t.Fatalf("unexpected failure: %+v", outcome.failure)
 			}
+			records := outcome.records
 			if len(records) != len(tc.wantPages) {
 				t.Fatalf("got %d records, want %d", len(records), len(tc.wantPages))
 			}
@@ -174,23 +175,23 @@ func TestCrawlSeedFailureKeepsPartialRecords(t *testing.T) {
 	server := chainServer(t, 3)
 	c := newCrawler(batchOptions{maxPages: 5})
 
-	records, failure := c.crawlSeed(context.Background(), server.URL+"/page/2")
-	if failure != nil {
-		t.Fatalf("unexpected failure: %+v", failure)
+	outcome := c.crawlSeed(context.Background(), 0, server.URL+"/page/2")
+	if outcome.failure != nil {
+		t.Fatalf("unexpected failure: %+v", outcome.failure)
 	}
-	if len(records) != 2 {
-		t.Fatalf("got %d records, want 2", len(records))
+	if len(outcome.records) != 2 {
+		t.Fatalf("got %d records, want 2", len(outcome.records))
 	}
 
 	// page 3 is the last in the chain; starting beyond it 404s immediately
-	records, failure = c.crawlSeed(context.Background(), server.URL+"/page/99")
-	if failure == nil {
+	outcome = c.crawlSeed(context.Background(), 0, server.URL+"/page/99")
+	if outcome.failure == nil {
 		t.Fatal("expected failure for missing page")
 	}
-	if len(records) != 0 {
-		t.Fatalf("got %d records, want 0", len(records))
+	if len(outcome.records) != 0 {
+		t.Fatalf("got %d records, want 0", len(outcome.records))
 	}
-	if failure.URL != server.URL+"/page/99" {
-		t.Errorf("failure url %q, want %q", failure.URL, server.URL+"/page/99")
+	if outcome.failure.URL != server.URL+"/page/99" {
+		t.Errorf("failure url %q, want %q", outcome.failure.URL, server.URL+"/page/99")
 	}
 }

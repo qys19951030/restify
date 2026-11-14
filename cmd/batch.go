@@ -6,13 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/itzg/restify"
 	"github.com/yhat/scrape"
 	"golang.org/x/net/html"
 )
@@ -50,12 +49,13 @@ type seedFailure struct {
 
 // batchSummary aggregates the outcome of a batch run for the final report.
 type batchSummary struct {
-	Succeeded int
-	Failed    int
-	Skipped   int
-	Deduped   int
-	Pages     int
-	Failures  []seedFailure
+	Succeeded   int
+	Failed      int
+	Skipped     int
+	Deduped     int
+	Pages       int
+	Interrupted bool
+	Failures    []seedFailure
 }
 
 // loadSeeds reads the seeds file: one URL per line, blank lines and lines
@@ -135,62 +135,27 @@ type pageResult struct {
 	nodes    json.RawMessage
 }
 
+// seedOutcome is what one seed's crawl produced.
+type seedOutcome struct {
+	records     []pageRecord
+	deduped     int
+	failure     *seedFailure
+	interrupted bool
+}
+
 // crawler holds the shared state of a batch run.
 type crawler struct {
-	opts   batchOptions
-	client *http.Client
+	opts    batchOptions
+	fetcher *fetcher
+	dedup   *deduper
 }
 
 func newCrawler(opts batchOptions) *crawler {
 	return &crawler{
-		opts: opts,
-		client: &http.Client{
-			Timeout: restify.HttpRequestTimeout,
-		},
+		opts:    opts,
+		fetcher: newFetcher(opts),
+		dedup:   newDeduper(),
 	}
-}
-
-// fetchPage retrieves one page and derives everything the pipeline needs
-// from it. Non-2xx responses are reported as errors.
-func (c *crawler) fetchPage(ctx context.Context, rawURL string) (*pageResult, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %w", err)
-	}
-	request.Header.Set("accept", "*/*")
-	if c.opts.userAgent != "" {
-		request.Header.Set("user-agent", c.opts.userAgent)
-	}
-	for key, value := range c.opts.headers {
-		request.Header.Set(key, value)
-	}
-
-	resp, err := c.client.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve response: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
-
-	root, err := html.Parse(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse response body: %w", err)
-	}
-
-	nodes, err := restify.ConvertHtmlToJson([]*html.Node{root})
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert page to JSON: %w", err)
-	}
-
-	return &pageResult{
-		finalURL: resp.Request.URL.String(),
-		status:   resp.StatusCode,
-		nextHref: findNextLink(root),
-		nodes:    nodes,
-	}, nil
 }
 
 // findNextLink returns the href of the first element carrying rel="next".
@@ -232,29 +197,45 @@ func resolveURL(base, href string) string {
 	return baseURL.ResolveReference(ref).String()
 }
 
-// crawlSeed follows the rel="next" chain starting at seed, returning the
-// records gathered so far even when the chain fails part-way.
-func (c *crawler) crawlSeed(ctx context.Context, seed string) ([]pageRecord, *seedFailure) {
-	var records []pageRecord
+// crawlSeed follows the rel="next" chain starting at seed. Pages already
+// fetched by another seed are not duplicated, but pagination still advances
+// using their content. A failure does not discard pages already gathered.
+func (c *crawler) crawlSeed(ctx context.Context, seedIndex int, seed string) seedOutcome {
+	var outcome seedOutcome
 	current := seed
 	for page := 1; current != "" && page <= c.opts.maxPages; page++ {
-		result, err := c.fetchPage(ctx, current)
+		norm, err := normalizeURL(current)
 		if err != nil {
-			return records, &seedFailure{Seed: seed, URL: current, Reason: err.Error()}
+			outcome.failure = &seedFailure{Seed: seed, URL: current, Reason: err.Error()}
+			return outcome
 		}
-		records = append(records, pageRecord{
-			URL:    result.finalURL,
-			Seed:   seed,
-			Page:   page,
-			Status: result.status,
-			Nodes:  result.nodes,
-		})
+		result, owned, err := c.dedup.get(ctx, seedIndex, norm, current, c.fetcher.fetch)
+		if err != nil {
+			if ctx.Err() != nil {
+				outcome.interrupted = true
+				return outcome
+			}
+			outcome.failure = &seedFailure{Seed: seed, URL: current, Reason: err.Error()}
+			return outcome
+		}
+		if !owned {
+			outcome.deduped++
+		} else {
+			outcome.records = append(outcome.records, pageRecord{
+				URL:    result.finalURL,
+				Seed:   seed,
+				Page:   page,
+				Status: result.status,
+				Nodes:  result.nodes,
+			})
+		}
 		current = resolveURL(result.finalURL, result.nextHref)
 	}
-	return records, nil
+	return outcome
 }
 
-// runBatch executes the whole batch crawl and reports the summary.
+// runBatch executes the whole batch crawl and reports the summary. Seeds are
+// crawled concurrently; the fetcher bounds the overall request rate.
 func runBatch(ctx context.Context, opts batchOptions) (*batchSummary, error) {
 	seeds, err := loadSeeds(opts.seedsPath)
 	if err != nil {
@@ -265,14 +246,28 @@ func runBatch(ctx context.Context, opts batchOptions) (*batchSummary, error) {
 	}
 
 	c := newCrawler(opts)
+	outcomes := make([]seedOutcome, len(seeds))
+	var wg sync.WaitGroup
+	for i, seed := range seeds {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			outcomes[i] = c.crawlSeed(ctx, i, seed)
+		}()
+	}
+	wg.Wait()
+
 	summary := &batchSummary{}
-	for _, seed := range seeds {
-		records, failure := c.crawlSeed(ctx, seed)
-		summary.Pages += len(records)
-		if failure != nil {
+	for _, outcome := range outcomes {
+		summary.Pages += len(outcome.records)
+		summary.Deduped += outcome.deduped
+		switch {
+		case outcome.interrupted:
+			summary.Interrupted = true
+		case outcome.failure != nil:
 			summary.Failed++
-			summary.Failures = append(summary.Failures, *failure)
-		} else {
+			summary.Failures = append(summary.Failures, *outcome.failure)
+		default:
 			summary.Succeeded++
 		}
 	}
